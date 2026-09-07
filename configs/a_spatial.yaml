@@ -1,0 +1,28 @@
+# Spatial DTI-INR (Model A) — placeholder config for later phases
+# Do not run until Task 2+ are implemented.
+
+dataset:
+  name: HCP-YA
+  subjects: []
+
+model:
+  name: spatial_dti_inr
+  hidden_dim: 128
+  num_layers: 4
+  activation: gelu
+  fourier_num_frequencies: 10
+  fourier_scale: 1.0
+
+training:
+  epochs: 100
+  batch_size: 4096
+  learning_rate: 1.0e-3
+  seed: 42
+
+sampling:
+  num_directions: null
+  direction_scheme: full
+  shells: null
+
+evaluation:
+  reference: WLS-DTI
