@@ -1,0 +1,45 @@
+{
+  "run_dir": "E:\\BaiduNetdiskDownload\\DTI-INR\\experiments\\v2_dti_param_field\\20260908_131139",
+  "n_subjects": 1,
+  "subjects": [
+    {
+      "note": "WLS-DTI is used as a reference, not as training supervision.",
+      "subject_id": "109830",
+      "model": "SpatialDTIParamFieldWithQ",
+      "hash_backend": "torch",
+      "device": "cuda",
+      "batch_size_used": 512,
+      "epochs_run": 50,
+      "final_train_MSE": 0.0002604359244378919,
+      "best_val_MSE": 0.00026130804748860216,
+      "comparison_slice_z": 59,
+      "FA_MAE": 0.016125674413652848,
+      "FA_RMSE": 0.06304922283126627,
+      "MD_MAE": 1.5912823374593894e-05,
+      "MD_RMSE": 7.637408771388808e-05,
+      "AD_MAE": 2.1860288191692536e-05,
+      "AD_RMSE": 8.340690255119376e-05,
+      "RD_MAE": 1.5184198031558214e-05,
+      "RD_RMSE": 7.509078327301386e-05,
+      "V1_angular_error": 4.8259775362163735,
+      "V1_angular_error_median": 1.913335424829582,
+      "Signal_MSE": 0.0002604275941848755,
+      "Signal_MAE": 0.012542184442281723,
+      "PSNR": 26.30391806446646
+    }
+  ],
+  "MEAN": {
+    "FA_MAE": 0.016125674413652848,
+    "FA_RMSE": 0.06304922283126627,
+    "MD_MAE": 1.5912823374593894e-05,
+    "MD_RMSE": 7.637408771388808e-05,
+    "AD_MAE": 2.1860288191692536e-05,
+    "AD_RMSE": 8.340690255119376e-05,
+    "RD_MAE": 1.5184198031558214e-05,
+    "RD_RMSE": 7.509078327301386e-05,
+    "V1_angular_error": 4.8259775362163735,
+    "Signal_MSE": 0.0002604275941848755,
+    "Signal_MAE": 0.012542184442281723,
+    "PSNR": 26.30391806446646
+  }
+}

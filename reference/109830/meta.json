@@ -1,0 +1,17 @@
+{
+  "subject_id": "109830",
+  "hcp_root": "E:/BaiduNetdiskDownload/HCP/3T 146",
+  "shells": [
+    1000.0
+  ],
+  "n_volumes": 108,
+  "n_b0": 18,
+  "n_dw": 90,
+  "signal_scale": 9899.1103515625,
+  "volume_shape": [
+    145,
+    174,
+    145
+  ],
+  "note": "Full b0 + Full b\u22481000 DIPY WLS reference. Not used as INR supervision."
+}

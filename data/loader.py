@@ -85,8 +85,15 @@ def load_hcp_subject(
     b0_thresh: float = 50.0,
     shell_tol: float = 100.0,
     signal_percentile: float = 99.0,
+    collapse_b0: bool = True,
 ) -> SubjectData:
-    """Load one HCP-YA subject (b0 + selected shells; default b1000 only)."""
+    """Load one HCP-YA subject (b0 + selected shells; default b1000 only).
+
+    Args:
+        collapse_b0: If True (default), average all b0 volumes into one mean-b0
+            so signal MSE is not dominated by repeated b0s. If False, keep all
+            b0 volumes (needed for full-data WLS reference fitting).
+    """
     if shells is None:
         shells = [1000.0]
 
@@ -137,26 +144,31 @@ def load_hcp_subject(
     dwi_sel = dwi_sel / signal_scale
     dwi_sel = np.clip(dwi_sel, 0.0, None).astype(np.float32)
 
-    # Collapse multiple b0 volumes into one mean b0 so MSE is not dominated by b0.
-    shell_local = np.where(bvals_sel >= b0_thresh)[0]
-    mean_b0 = dwi_sel[..., b0_local].mean(axis=-1, keepdims=True)
-    dwi = np.concatenate([mean_b0, dwi_sel[..., shell_local]], axis=-1).astype(np.float32)
-    bvals_out = np.concatenate(
-        [[0.0], bvals_sel[shell_local].astype(np.float64)]
-    ).astype(np.float32)
-    bvecs_out = np.concatenate(
-        [np.zeros((1, 3), dtype=np.float32), bvecs_sel[shell_local].astype(np.float32)],
-        axis=0,
-    )
+    if collapse_b0:
+        # Collapse multiple b0 volumes into one mean b0 so MSE is not dominated by b0.
+        shell_local = np.where(bvals_sel >= b0_thresh)[0]
+        mean_b0 = dwi_sel[..., b0_local].mean(axis=-1, keepdims=True)
+        dwi = np.concatenate([mean_b0, dwi_sel[..., shell_local]], axis=-1).astype(np.float32)
+        bvals_out = np.concatenate(
+            [[0.0], bvals_sel[shell_local].astype(np.float64)]
+        ).astype(np.float32)
+        bvecs_out = np.concatenate(
+            [np.zeros((1, 3), dtype=np.float32), bvecs_sel[shell_local].astype(np.float32)],
+            axis=0,
+        )
+        # shell_indices: map mean-b0 to first original b0, then DW vols
+        sel_out = np.concatenate([[sel[b0_local[0]]], sel[shell_local]]).astype(np.int64)
+    else:
+        dwi = dwi_sel
+        bvals_out = bvals_sel.astype(np.float32)
+        bvecs_out = bvecs_sel.astype(np.float32)
+        sel_out = sel
+
     # Normalize non-zero gradient directions
     norms = np.linalg.norm(bvecs_out, axis=1, keepdims=True)
     nonzero = norms[:, 0] > 1e-8
     bvecs_out[nonzero] = bvecs_out[nonzero] / norms[nonzero]
     bvecs_out[~nonzero] = 0.0
-
-    dwi = dwi
-    bvals_sel = bvals_out
-    bvecs_sel = bvecs_out
 
     coords_xyz = np.argwhere(mask).astype(np.int64)  # [V,3]
     coords_norm = normalize_coords(coords_xyz, dwi.shape[:3]).astype(np.float32)
@@ -164,14 +176,14 @@ def load_hcp_subject(
     return SubjectData(
         subject_id=subject_id,
         dwi=dwi,
-        bvals=bvals_sel.astype(np.float32),
-        bvecs=bvecs_sel.astype(np.float32),
+        bvals=bvals_out.astype(np.float32),
+        bvecs=bvecs_out.astype(np.float32),
         mask=mask,
         affine=affine,
         coords_xyz=coords_xyz,
         coords_norm=coords_norm,
         signal_scale=signal_scale,
-        shell_indices=sel,
+        shell_indices=sel_out,
         volume_shape=tuple(int(x) for x in dwi.shape[:3]),
     )
 

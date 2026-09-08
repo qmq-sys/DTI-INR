@@ -1,0 +1,47 @@
+# Version-two SpatialDTIParamFieldWithQ (DTI only, no DKI)
+# Same setup as v2_dti_param_field.yaml but with q_feature enabled.
+
+dataset:
+  name: HCP-YA
+  hcp_root: "E:/BaiduNetdiskDownload/HCP/3T 146"
+  subjects:
+    - "109830"
+    - "124422"
+    - "124624"
+    - "130316"
+    - "130720"
+    - "131217"
+
+model:
+  name: spatial_dti_param_field_with_q
+  hidden_dim: 128
+  num_layers: 4
+  use_hashgrid: true
+  hashgrid_concat_xyz: true
+  use_q_feature: true
+  q_embed_dim: 32
+  hash_encoding:
+    n_levels: 16
+    n_features_per_level: 2
+    log2_hashmap_size: 19
+    base_resolution: 16
+    max_resolution: 1024
+
+training:
+  epochs: 200
+  batch_size: 4096
+  learning_rate: 1.0e-3
+  seed: 42
+  b_scale: 1000.0
+  early_stop: true
+  early_stop_patience: 25
+  early_stop_min_delta: 1.0e-6
+  val_fraction: 0.1
+
+sampling:
+  shells: [1000.0]
+  direction_scheme: full
+
+evaluation:
+  reference: WLS-DTI
+  reference_note: "WLS-DTI is used as a reference, not as training supervision."

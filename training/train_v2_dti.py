@@ -447,60 +447,90 @@ def train_one_subject(
     return payload
 
 
-def train(config: dict) -> Path:
+METRIC_KEYS = [
+    "FA_MAE",
+    "FA_RMSE",
+    "MD_MAE",
+    "MD_RMSE",
+    "AD_MAE",
+    "AD_RMSE",
+    "RD_MAE",
+    "RD_RMSE",
+    "V1_angular_error",
+    "Signal_MSE",
+    "Signal_MAE",
+    "PSNR",
+]
+
+
+def _load_existing_metrics(run_dir: Path) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    for path in sorted(run_dir.glob("hcp_*/metrics.json")):
+        with open(path, encoding="utf-8") as f:
+            row = json.load(f)
+        sid = str(row.get("subject_id") or path.parent.name.replace("hcp_", ""))
+        if "error" not in row and all(k in row for k in METRIC_KEYS):
+            found[sid] = row
+    return found
+
+
+def _write_summary(run_dir: Path, rows: list[dict]) -> dict:
+    ok = [r for r in rows if "error" not in r and all(k in r for k in METRIC_KEYS)]
+    summary: dict = {"run_dir": str(run_dir), "n_subjects": len(ok), "subjects": rows}
+    if ok:
+        summary["MEAN"] = {k: float(np.mean([r[k] for r in ok])) for k in METRIC_KEYS}
+    with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    with open(run_dir / "summary.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["subject_id", *METRIC_KEYS])
+        for r in ok:
+            writer.writerow([r["subject_id"], *[r[k] for k in METRIC_KEYS]])
+        if ok:
+            writer.writerow(["MEAN", *[summary["MEAN"][k] for k in METRIC_KEYS]])
+    return summary
+
+
+def train(config: dict, run_dir: Path | None = None, skip_done: bool = True) -> Path:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = ROOT / "experiments" / "v2_dti_param_field" / stamp
+    if run_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = ROOT / "experiments" / "v2_dti_param_field" / stamp
+    run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
 
     subjects = [str(s) for s in config["dataset"]["subjects"]]
+    existing = _load_existing_metrics(run_dir) if skip_done else {}
     print(f"[run] {run_dir}")
     print(f"[run] subjects={subjects}, device={device}")
+    if existing:
+        print(f"[run] already done: {sorted(existing)}")
 
-    rows: list[dict] = []
+    rows_by_id: dict[str, dict] = dict(existing)
     for sid in subjects:
+        if sid in rows_by_id:
+            print(f"[skip] subject {sid} already has metrics")
+            continue
         try:
-            row = train_one_subject(config, sid, run_dir, device)
-            rows.append(row)
+            rows_by_id[sid] = train_one_subject(config, sid, run_dir, device)
         except Exception as exc:
             print(f"[error] subject {sid} failed: {exc}")
-            rows.append({"subject_id": sid, "error": str(exc)})
+            rows_by_id[sid] = {"subject_id": sid, "error": str(exc)}
+        # Persist partial summary after each subject
+        ordered = [rows_by_id[s] for s in subjects if s in rows_by_id]
+        _write_summary(run_dir, ordered)
 
-    metric_keys = [
-        "FA_MAE",
-        "FA_RMSE",
-        "MD_MAE",
-        "MD_RMSE",
-        "AD_MAE",
-        "AD_RMSE",
-        "RD_MAE",
-        "RD_RMSE",
-        "V1_angular_error",
-        "Signal_MSE",
-        "Signal_MAE",
-        "PSNR",
-    ]
-    ok = [r for r in rows if "error" not in r]
-    summary: dict = {"run_dir": str(run_dir), "n_subjects": len(ok), "subjects": rows}
-    if ok:
-        means = {k: float(np.mean([r[k] for r in ok])) for k in metric_keys}
-        summary["MEAN"] = means
-
-    with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    with open(run_dir / "summary.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["subject_id", *metric_keys])
-        for r in ok:
-            writer.writerow([r["subject_id"], *[r[k] for k in metric_keys]])
-        if ok:
-            writer.writerow(["MEAN", *[summary["MEAN"][k] for k in metric_keys]])
+    ordered = [rows_by_id.get(s, {"subject_id": s, "error": "missing"}) for s in subjects]
+    # Also include any completed subjects not in the requested list (resume safety)
+    for sid, row in rows_by_id.items():
+        if sid not in subjects:
+            ordered.append(row)
+    summary = _write_summary(run_dir, ordered)
 
     print("\n[done]", run_dir)
-    if ok:
+    if "MEAN" in summary:
         print("[MEAN]", json.dumps(summary["MEAN"], indent=2))
     return run_dir
 
@@ -522,6 +552,17 @@ def main() -> None:
         help="Override subject list from config",
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Resume / write into an existing experiment folder",
+    )
+    parser.add_argument(
+        "--no-skip-done",
+        action="store_true",
+        help="Retrain subjects even if metrics.json already exists",
+    )
     args = parser.parse_args()
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -529,7 +570,8 @@ def main() -> None:
         config["dataset"]["subjects"] = list(args.subjects)
     if args.epochs is not None:
         config["training"]["epochs"] = int(args.epochs)
-    train(config)
+    run_dir = Path(args.run_dir) if args.run_dir else None
+    train(config, run_dir=run_dir, skip_done=not args.no_skip_done)
 
 
 if __name__ == "__main__":
