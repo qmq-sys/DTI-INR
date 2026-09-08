@@ -1,1 +1,17 @@
-"""INR models — implemented starting Task 2. Do not implement A/B in Task 1."""
+"""Package init for models."""
+
+from models.positional_encoding import FourierPositionalEncoding
+from models.spatial_dti_inr import SpatialDTIINR
+from models.spatial_dti_param_field import (
+    HashEncoding,
+    SpatialDTIParamField,
+    SpatialDTIParamFieldWithQ,
+)
+
+__all__ = [
+    "FourierPositionalEncoding",
+    "SpatialDTIINR",
+    "HashEncoding",
+    "SpatialDTIParamField",
+    "SpatialDTIParamFieldWithQ",
+]

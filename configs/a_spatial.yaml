@@ -1,28 +1,31 @@
-# Spatial DTI-INR (Model A) — placeholder config for later phases
-# Do not run until Task 2+ are implemented.
+# Spatial DTI-INR (Model A) — first real-data experiment
+# WLS-DTI is used as a reference, not as training supervision.
 
 dataset:
   name: HCP-YA
-  subjects: []
+  hcp_root: "E:/BaiduNetdiskDownload/HCP/3T 146"
+  subjects:
+    - "131217"
 
 model:
   name: spatial_dti_inr
   hidden_dim: 128
   num_layers: 4
+  num_frequencies: 8
   activation: gelu
-  fourier_num_frequencies: 10
-  fourier_scale: 1.0
 
 training:
-  epochs: 100
-  batch_size: 4096
+  epochs: 800
+  batch_size: 8192
   learning_rate: 1.0e-3
   seed: 42
+  b_scale: 1000.0   # train with b'=b/1000; D_mm2s = D_network / b_scale
+  # note: loader collapses multiple b0s into one mean b0 to avoid b0-dominated MSE
 
 sampling:
-  num_directions: null
+  shells: [1000.0]  # b0 + b≈1000 only
   direction_scheme: full
-  shells: null
 
 evaluation:
   reference: WLS-DTI
+  reference_note: "WLS-DTI is used as a reference, not as training supervision."
