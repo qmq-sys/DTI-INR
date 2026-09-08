@@ -1,18 +1,24 @@
-"""Full-data Reference Sparse DTI Estimation (pilot).
+"""Full-data Reference Sparse DTI Estimation.
 
-Pipeline
---------
-1) Load Full b0 + Full b=1000
-2) DIPY WLS -> D_ref / FA_ref / ...  saved under ``reference/<subject_id>/``
-3) Sparse subsample: 1 b0 + {6,15,30,45} b1000 directions
-4) Sparse WLS and DTI-INR on identical sparse input
-5) Score both against Full Reference (not against each other)
+Experiment 1 (pilot)
+--------------------
+1 subject, one sampling seed, directions in {6,15,30,45}.
+Sparse WLS + DTI-INR vs Full Reference.
+
+Experiment 2 (multi-seed sparse robustness)
+-------------------------------------------
+subject=109830, directions=[6,15,30,45], seeds=[1,2,3,4,5]
+Methods: Sparse WLS, DTI-INR
+Metrics: FA/MD/AD/RD MAE, V1 angular error, Signal NRMSE
+Output: mean ± std tables + curves vs #directions.
 
 Usage::
 
-    cd DTI-INR
+    # Exp1
     python scripts/run_sparse_vs_full_ref.py --config configs/sparse_vs_full_ref.yaml
-    python scripts/run_sparse_vs_full_ref.py --subjects 109830 --n-directions 6
+
+    # Exp2
+    python scripts/run_sparse_vs_full_ref.py --config configs/sparse_vs_full_ref_exp2.yaml --exp2
 """
 
 from __future__ import annotations
@@ -21,9 +27,11 @@ import argparse
 import csv
 import json
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import torch
@@ -37,16 +45,18 @@ from baselines.wls_dti import fit_wls_dti  # noqa: E402
 from data.loader import SubjectData, load_hcp_subject  # noqa: E402
 from data.sampling import make_sparse_protocol  # noqa: E402
 from evaluation.dti_metrics import compare_dti_maps  # noqa: E402
+from evaluation.signal_metrics import signal_nrmse  # noqa: E402
 from training.train_v2_dti import (  # noqa: E402
+    _forward_s0_d,
     build_model,
     infer_dti_maps,
     predict_signals_multi,
     set_seed,
-    _forward_s0_d,
 )
 from visualization.parameter_maps import save_comparison_figure  # noqa: E402
 
 REF_KEYS = ("FA", "MD", "AD", "RD", "V1", "D", "S0")
+EXP2_METRIC_KEYS = ("FA_MAE", "MD_MAE", "AD_MAE", "RD_MAE", "V1_error", "Signal_NRMSE")
 
 
 def save_reference_maps(
@@ -56,7 +66,6 @@ def save_reference_maps(
     *,
     meta: dict | None = None,
 ) -> None:
-    """Save Full Reference under ``reference/<subject_id>/`` with ``*_ref`` names."""
     out_dir.mkdir(parents=True, exist_ok=True)
     for key in REF_KEYS:
         path = out_dir / f"{key}_ref.nii.gz"
@@ -85,13 +94,12 @@ def build_or_load_full_reference(
     shells: list[float],
     force: bool = False,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, Path, SubjectData]:
-    """Fit Full WLS reference (all b0 + all b1000) and save to reference/<id>/."""
     ref_dir = ref_root / str(subject_id)
     full = load_hcp_subject(
         hcp_root=hcp_root,
         subject_id=subject_id,
         shells=shells,
-        collapse_b0=False,  # Full b0 + Full b1000
+        collapse_b0=False,
     )
     need = [ref_dir / f"{k}_ref.nii.gz" for k in REF_KEYS]
     if (not force) and all(p.is_file() for p in need):
@@ -104,9 +112,7 @@ def build_or_load_full_reference(
         f"shape={full.dwi.shape}, n_b0={(full.bvals < 50).sum()}, "
         f"n_dw={(full.bvals >= 50).sum()}"
     )
-    # WLS on physical-ish intensities: data already / signal_scale
     wls = fit_wls_dti(full.dwi, full.bvals, full.bvecs, mask=full.mask)
-    # Store S0 in original intensity units for readability
     maps = {
         "FA": wls["FA"].astype(np.float32),
         "MD": wls["MD"].astype(np.float32),
@@ -136,9 +142,11 @@ def train_inr_on_sparse(
     sparse: SubjectData,
     config: dict,
     device: torch.device,
+    *,
+    train_seed: int | None = None,
 ) -> torch.nn.Module:
-    """Train SpatialDTIParamField on sparse volumes (signal MSE only)."""
-    set_seed(int(config["training"]["seed"]))
+    seed = int(config["training"]["seed"] if train_seed is None else train_seed)
+    set_seed(seed)
     b_scale = float(config["training"].get("b_scale", 1000.0))
     batch_size = int(config["training"]["batch_size"])
     epochs = int(config["training"]["epochs"])
@@ -149,10 +157,9 @@ def train_inr_on_sparse(
     min_delta = float(config["training"].get("early_stop_min_delta", 1e-6))
 
     x_np = sparse.coords_xyz
-    # signals from sparse.dwi
     sig = sparse.dwi[x_np[:, 0], x_np[:, 1], x_np[:, 2], :].astype(np.float32)
     n_vox = sig.shape[0]
-    rng = np.random.default_rng(int(config["training"]["seed"]))
+    rng = np.random.default_rng(seed)
     perm = rng.permutation(n_vox)
     n_val = max(1, int(round(val_frac * n_vox)))
     idx_val = perm[:n_val]
@@ -200,7 +207,11 @@ def train_inr_on_sparse(
             x = coords_t[sel].to(device)
             y = signals_t[sel].to(device)
             S0, D = _forward_s0_d(
-                model, x, s=y if use_q else None, bvals=bvals_t if use_q else None, bvecs=bvecs_t if use_q else None
+                model,
+                x,
+                s=y if use_q else None,
+                bvals=bvals_t if use_q else None,
+                bvecs=bvecs_t if use_q else None,
             )
             pred = predict_signals_multi(S0, D, g, b)
             loss = torch.mean((pred - y) ** 2)
@@ -252,7 +263,9 @@ def train_inr_on_sparse(
     return model
 
 
-def metrics_vs_ref(pred: dict[str, np.ndarray], ref: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, float]:
+def metrics_vs_ref(
+    pred: dict[str, np.ndarray], ref: dict[str, np.ndarray], mask: np.ndarray
+) -> dict[str, float]:
     raw = compare_dti_maps(pred, ref, mask)
     return {
         "FA_MAE": raw["FA_MAE"],
@@ -268,105 +281,197 @@ def metrics_vs_ref(pred: dict[str, np.ndarray], ref: dict[str, np.ndarray], mask
     }
 
 
+def _masked_signals(data: SubjectData) -> np.ndarray:
+    x, y, z = data.coords_xyz[:, 0], data.coords_xyz[:, 1], data.coords_xyz[:, 2]
+    return data.dwi[x, y, z, :].astype(np.float32)
+
+
+def wls_predict_signals(
+    wls: dict[str, np.ndarray],
+    data: SubjectData,
+) -> np.ndarray:
+    """Forward-simulate sparse signals from WLS (S0, D) on masked voxels."""
+    xyz = data.coords_xyz
+    S0 = wls["S0"][xyz[:, 0], xyz[:, 1], xyz[:, 2]].astype(np.float64)  # normalized units
+    D = wls["D"][xyz[:, 0], xyz[:, 1], xyz[:, 2]].astype(np.float64)  # [V,3,3]
+    g = data.bvecs.astype(np.float64)
+    b = data.bvals.astype(np.float64)
+    Dg = np.einsum("vij,nj->vni", D, g)
+    q = np.einsum("nj,vnj->vn", g, Dg)
+    exponent = np.clip(-b[None, :] * q, -60.0, 60.0)
+    return (S0[:, None] * np.exp(exponent)).astype(np.float32)
+
+
+@torch.no_grad()
+def inr_predict_signals(
+    model: torch.nn.Module,
+    data: SubjectData,
+    device: torch.device,
+    b_scale: float,
+    chunk: int = 4096,
+) -> np.ndarray:
+    model.eval()
+    g = torch.from_numpy(data.bvecs).to(device)
+    b = torch.from_numpy(data.bvals / b_scale).to(device)
+    bvals = torch.from_numpy(data.bvals).to(device)
+    bvecs = torch.from_numpy(data.bvecs).to(device)
+    coords = torch.from_numpy(data.coords_norm).to(device)
+    sig = torch.from_numpy(_masked_signals(data)).to(device)
+    use_q = getattr(model, "uses_q_feature", False)
+    preds = []
+    for i in range(0, coords.shape[0], chunk):
+        sl = slice(i, i + chunk)
+        S0, D = _forward_s0_d(
+            model,
+            coords[sl],
+            s=sig[sl] if use_q else None,
+            bvals=bvals if use_q else None,
+            bvecs=bvecs if use_q else None,
+        )
+        preds.append(predict_signals_multi(S0, D, g, b).cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+def run_one_sparse_trial(
+    *,
+    subject_id: str,
+    n_dir: int,
+    sample_seed: int,
+    full_collapsed: SubjectData,
+    ref_maps: dict[str, np.ndarray],
+    config: dict,
+    device: torch.device,
+    out_dir: Path | None,
+    save_figures: bool,
+) -> tuple[dict, dict]:
+    """Run Sparse WLS + DTI-INR for one (n_dir, seed). Returns (wls_row, inr_row)."""
+    b_scale = float(config["training"].get("b_scale", 1000.0))
+    sparse, proto = make_sparse_protocol(full_collapsed, n_dir, seed=sample_seed)
+    obs = _masked_signals(sparse)
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(out_dir / "sparse_protocol.json", "w", encoding="utf-8") as f:
+            json.dump(proto, f, indent=2)
+
+    print(f"[wls] n={n_dir} seed={sample_seed}")
+    wls = fit_wls_dti(sparse.dwi, sparse.bvals, sparse.bvecs, mask=sparse.mask)
+    wls_maps = {
+        "FA": wls["FA"].astype(np.float32),
+        "MD": wls["MD"].astype(np.float32),
+        "AD": wls["AD"].astype(np.float32),
+        "RD": wls["RD"].astype(np.float32),
+        "V1": wls["V1"].astype(np.float32),
+        "S0": (wls["S0"] * sparse.signal_scale).astype(np.float32),
+        "D": wls["D"].astype(np.float32),
+    }
+    # Signal NRMSE uses normalized S0 (same units as sparse.dwi)
+    wls_sig = wls_predict_signals(
+        {"S0": wls["S0"].astype(np.float32), "D": wls["D"].astype(np.float32)},
+        sparse,
+    )
+    wls_m = metrics_vs_ref(wls_maps, ref_maps, sparse.mask)
+    wls_m["Signal_NRMSE"] = signal_nrmse(wls_sig, obs)
+    row_wls = {
+        "subject_id": subject_id,
+        "n_directions": n_dir,
+        "seed": sample_seed,
+        "method": "Sparse_WLS",
+        **wls_m,
+    }
+
+    print(f"[inr] n={n_dir} seed={sample_seed}")
+    # Direction sample seed + train seed share the trial seed for reproducibility
+    cfg = dict(config)
+    cfg["training"] = dict(config["training"])
+    cfg["training"]["seed"] = int(sample_seed)
+    model = train_inr_on_sparse(sparse, cfg, device, train_seed=int(sample_seed))
+    inr_maps = infer_dti_maps(model, sparse, device, b_scale=b_scale)
+    inr_sig = inr_predict_signals(model, sparse, device, b_scale=b_scale)
+    inr_m = metrics_vs_ref(inr_maps, ref_maps, sparse.mask)
+    inr_m["Signal_NRMSE"] = signal_nrmse(inr_sig, obs)
+    row_inr = {
+        "subject_id": subject_id,
+        "n_directions": n_dir,
+        "seed": sample_seed,
+        "method": "DTI_INR",
+        **inr_m,
+    }
+
+    if out_dir is not None:
+        with open(out_dir / "metrics_wls.json", "w", encoding="utf-8") as f:
+            json.dump(row_wls, f, indent=2)
+        with open(out_dir / "metrics_inr.json", "w", encoding="utf-8") as f:
+            json.dump(row_inr, f, indent=2)
+        torch.save(
+            {"model_state": model.state_dict(), "config": cfg, "protocol": proto},
+            out_dir / "checkpoint.pt",
+        )
+        if save_figures:
+            save_comparison_figure(
+                ref_maps,
+                inr_maps,
+                sparse.mask,
+                out_dir / "comparison_inr_vs_ref.png",
+                title=f"{subject_id} n={n_dir} seed={sample_seed}: FullRef | INR | |Error|",
+            )
+            save_comparison_figure(
+                ref_maps,
+                wls_maps,
+                sparse.mask,
+                out_dir / "comparison_wls_vs_ref.png",
+                title=f"{subject_id} n={n_dir} seed={sample_seed}: FullRef | SparseWLS | |Error|",
+            )
+
+    print(
+        f"[table] n={n_dir} seed={sample_seed}\n"
+        f"  Sparse_WLS  FA={wls_m['FA_MAE']:.4f} MD={wls_m['MD_MAE']:.4g} "
+        f"AD={wls_m['AD_MAE']:.4g} RD={wls_m['RD_MAE']:.4g} "
+        f"V1={wls_m['V1_error']:.2f} NRMSE={wls_m['Signal_NRMSE']:.4f}\n"
+        f"  DTI_INR     FA={inr_m['FA_MAE']:.4f} MD={inr_m['MD_MAE']:.4g} "
+        f"AD={inr_m['AD_MAE']:.4g} RD={inr_m['RD_MAE']:.4g} "
+        f"V1={inr_m['V1_error']:.2f} NRMSE={inr_m['Signal_NRMSE']:.4f}"
+    )
+    return row_wls, row_inr
+
+
 def run_subject(config: dict, subject_id: str, run_dir: Path, device: torch.device) -> list[dict]:
     hcp_root = config["dataset"]["hcp_root"]
     shells = list(config.get("reference", {}).get("shells", [1000.0]))
     ref_root = ROOT / str(config.get("reference", {}).get("root", "reference"))
     n_list = [int(x) for x in config["sparse"]["n_directions"]]
     seed = int(config["sparse"].get("seed", 42))
-    b_scale = float(config["training"].get("b_scale", 1000.0))
 
-    ref_maps, affine, ref_dir, _full_for_meta = build_or_load_full_reference(
+    ref_maps, _affine, _ref_dir, _full = build_or_load_full_reference(
         hcp_root=hcp_root,
         subject_id=subject_id,
         ref_root=ref_root,
         shells=shells,
     )
-
-    # Collapsed mean-b0 + full b1000 for sparse sampling / INR training
     full_collapsed = load_hcp_subject(
         hcp_root=hcp_root,
         subject_id=subject_id,
         shells=shells,
         collapse_b0=True,
     )
-    # Align signal_scale with reference fit if possible
-    meta_path = ref_dir / "meta.json"
-    if meta_path.is_file():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        # full_collapsed already uses same percentile scale from loader
 
     subj_dir = run_dir / f"hcp_{subject_id}"
     subj_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
-
     for n_dir in n_list:
-        tag = f"n{n_dir}"
-        out = subj_dir / tag
-        out.mkdir(parents=True, exist_ok=True)
-        print(f"\n===== {subject_id} | 1 b0 + {n_dir} DW =====")
-
-        sparse, proto = make_sparse_protocol(full_collapsed, n_dir, seed=seed)
-        with open(out / "sparse_protocol.json", "w", encoding="utf-8") as f:
-            json.dump(proto, f, indent=2)
-
-        # --- Sparse WLS ---
-        print("[wls] fitting sparse WLS ...")
-        wls = fit_wls_dti(sparse.dwi, sparse.bvals, sparse.bvecs, mask=sparse.mask)
-        wls_maps = {
-            "FA": wls["FA"].astype(np.float32),
-            "MD": wls["MD"].astype(np.float32),
-            "AD": wls["AD"].astype(np.float32),
-            "RD": wls["RD"].astype(np.float32),
-            "V1": wls["V1"].astype(np.float32),
-            "S0": (wls["S0"] * sparse.signal_scale).astype(np.float32),
-        }
-        wls_m = metrics_vs_ref(wls_maps, ref_maps, sparse.mask)
-        row_wls = {"subject_id": subject_id, "n_directions": n_dir, "method": "Sparse_WLS", **wls_m}
-        rows.append(row_wls)
-        with open(out / "metrics_wls.json", "w", encoding="utf-8") as f:
-            json.dump(row_wls, f, indent=2)
-
-        # --- DTI-INR ---
-        print("[inr] training DTI-INR on sparse input ...")
-        model = train_inr_on_sparse(sparse, config, device)
-        inr_maps = infer_dti_maps(model, sparse, device, b_scale=b_scale)
-        inr_m = metrics_vs_ref(inr_maps, ref_maps, sparse.mask)
-        row_inr = {"subject_id": subject_id, "n_directions": n_dir, "method": "DTI_INR", **inr_m}
-        rows.append(row_inr)
-        with open(out / "metrics_inr.json", "w", encoding="utf-8") as f:
-            json.dump(row_inr, f, indent=2)
-
-        torch.save(
-            {"model_state": model.state_dict(), "config": config, "protocol": proto},
-            out / "checkpoint.pt",
+        print(f"\n===== {subject_id} | 1 b0 + {n_dir} DW | seed={seed} =====")
+        wls_row, inr_row = run_one_sparse_trial(
+            subject_id=subject_id,
+            n_dir=n_dir,
+            sample_seed=seed,
+            full_collapsed=full_collapsed,
+            ref_maps=ref_maps,
+            config=config,
+            device=device,
+            out_dir=subj_dir / f"n{n_dir}",
+            save_figures=True,
         )
-
-        # Comparison figure: Ref | SparseWLS | INR  for FA (and full panel vs ref for INR)
-        save_comparison_figure(
-            ref_maps,
-            inr_maps,
-            sparse.mask,
-            out / "comparison_inr_vs_ref.png",
-            title=f"{subject_id} n={n_dir}: FullRef | INR | |Error|",
-        )
-        save_comparison_figure(
-            ref_maps,
-            wls_maps,
-            sparse.mask,
-            out / "comparison_wls_vs_ref.png",
-            title=f"{subject_id} n={n_dir}: FullRef | SparseWLS | |Error|",
-        )
-
-        # Compact table print
-        print(
-            f"[table] n={n_dir}\n"
-            f"  Sparse_WLS  FA_MAE={wls_m['FA_MAE']:.4f}  MD_MAE={wls_m['MD_MAE']:.4g}  "
-            f"AD_MAE={wls_m['AD_MAE']:.4g}  RD_MAE={wls_m['RD_MAE']:.4g}  V1={wls_m['V1_error']:.2f}°\n"
-            f"  DTI_INR     FA_MAE={inr_m['FA_MAE']:.4f}  MD_MAE={inr_m['MD_MAE']:.4g}  "
-            f"AD_MAE={inr_m['AD_MAE']:.4g}  RD_MAE={inr_m['RD_MAE']:.4g}  V1={inr_m['V1_error']:.2f}°"
-        )
-
+        rows.extend([wls_row, inr_row])
     return rows
 
 
@@ -374,12 +479,14 @@ def write_tables(rows: list[dict], run_dir: Path) -> None:
     keys = [
         "subject_id",
         "n_directions",
+        "seed",
         "method",
         "FA_MAE",
         "MD_MAE",
         "AD_MAE",
         "RD_MAE",
         "V1_error",
+        "Signal_NRMSE",
         "FA_RMSE",
         "MD_RMSE",
         "AD_RMSE",
@@ -393,22 +500,225 @@ def write_tables(rows: list[dict], run_dir: Path) -> None:
     with open(run_dir / "results_table.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2)
 
-    # Pretty markdown-style summary for the requested Method columns
     lines = [
-        "| n_dir | Method | FA MAE | MD MAE | AD MAE | RD MAE | V1 error |",
-        "|------:|:-------|-------:|-------:|-------:|-------:|---------:|",
+        "| n_dir | seed | Method | FA MAE | MD MAE | AD MAE | RD MAE | V1 error | Signal NRMSE |",
+        "|------:|-----:|:-------|-------:|-------:|-------:|-------:|---------:|-------------:|",
     ]
     for r in rows:
         lines.append(
-            f"| {r['n_directions']} | {r['method']} | {r['FA_MAE']:.4f} | {r['MD_MAE']:.4g} | "
-            f"{r['AD_MAE']:.4g} | {r['RD_MAE']:.4g} | {r['V1_error']:.2f} |"
+            f"| {r.get('n_directions', '')} | {r.get('seed', '')} | {r['method']} | "
+            f"{r['FA_MAE']:.4f} | {r['MD_MAE']:.4g} | {r['AD_MAE']:.4g} | {r['RD_MAE']:.4g} | "
+            f"{r['V1_error']:.2f} | {r.get('Signal_NRMSE', float('nan')):.4f} |"
         )
     (run_dir / "results_table.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n" + "\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Experiment 2: multi-seed aggregation + plots
+# ---------------------------------------------------------------------------
+
+
+def aggregate_mean_std(rows: list[dict]) -> list[dict]:
+    """Group by (n_directions, method) -> mean/std over seeds."""
+    buckets: dict[tuple[int, str], list[dict]] = defaultdict(list)
+    for r in rows:
+        buckets[(int(r["n_directions"]), str(r["method"]))].append(r)
+
+    summary = []
+    for (n_dir, method), group in sorted(buckets.items(), key=lambda x: (x[0][0], x[0][1])):
+        row: dict = {
+            "n_directions": n_dir,
+            "method": method,
+            "n_seeds": len(group),
+        }
+        for k in EXP2_METRIC_KEYS:
+            vals = np.asarray([float(g[k]) for g in group], dtype=np.float64)
+            row[f"{k}_mean"] = float(np.mean(vals))
+            row[f"{k}_std"] = float(np.std(vals, ddof=1)) if vals.size > 1 else 0.0
+            row[f"{k}_mean_std"] = f"{row[f'{k}_mean']:.6g} ± {row[f'{k}_std']:.6g}"
+        summary.append(row)
+    return summary
+
+
+def write_exp2_summary(summary: list[dict], raw_rows: list[dict], run_dir: Path) -> None:
+    with open(run_dir / "exp2_raw_results.json", "w", encoding="utf-8") as f:
+        json.dump(raw_rows, f, indent=2)
+    with open(run_dir / "exp2_mean_std.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    fieldnames = ["n_directions", "method", "n_seeds"]
+    for k in EXP2_METRIC_KEYS:
+        fieldnames += [f"{k}_mean", f"{k}_std", f"{k}_mean_std"]
+    with open(run_dir / "exp2_mean_std.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in summary:
+            w.writerow(r)
+
+    lines = [
+        "| n_dir | Method | FA MAE | MD MAE | AD MAE | RD MAE | V1 error | Signal NRMSE |",
+        "|------:|:-------|-------:|-------:|-------:|-------:|---------:|-------------:|",
+    ]
+    for r in summary:
+        lines.append(
+            f"| {r['n_directions']} | {r['method']} | "
+            f"{r['FA_MAE_mean_std']} | {r['MD_MAE_mean_std']} | "
+            f"{r['AD_MAE_mean_std']} | {r['RD_MAE_mean_std']} | "
+            f"{r['V1_error_mean_std']} | {r['Signal_NRMSE_mean_std']} |"
+        )
+    text = "\n".join(lines) + "\n"
+    (run_dir / "exp2_mean_std.md").write_text(text, encoding="utf-8")
+    print("\n=== Experiment 2: mean ± std ===\n" + text)
+
+
+def plot_exp2_curves(summary: list[dict], run_dir: Path) -> None:
+    """Plot metric vs #directions for Sparse_WLS and DTI_INR (mean ± std)."""
+    plot_specs = [
+        ("FA_MAE", "FA MAE", "FA_MAE_vs_directions.png"),
+        ("MD_MAE", "MD MAE", "MD_MAE_vs_directions.png"),
+        ("AD_MAE", "AD MAE", "AD_MAE_vs_directions.png"),
+        ("RD_MAE", "RD MAE", "RD_MAE_vs_directions.png"),
+        ("V1_error", "V1 angular error (deg)", "V1_error_vs_directions.png"),
+        ("Signal_NRMSE", "Signal NRMSE", "Signal_NRMSE_vs_directions.png"),
+    ]
+    methods = ["Sparse_WLS", "DTI_INR"]
+    colors = {"Sparse_WLS": "#1f77b4", "DTI_INR": "#d62728"}
+    fig_dir = run_dir / "plots"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    for key, ylabel, fname in plot_specs:
+        fig, ax = plt.subplots(figsize=(6.5, 4.2))
+        for method in methods:
+            rows = [r for r in summary if r["method"] == method]
+            rows = sorted(rows, key=lambda r: int(r["n_directions"]))
+            if not rows:
+                continue
+            xs = [int(r["n_directions"]) for r in rows]
+            ys = [float(r[f"{key}_mean"]) for r in rows]
+            es = [float(r[f"{key}_std"]) for r in rows]
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=es,
+                marker="o",
+                capsize=4,
+                label=method.replace("_", " "),
+                color=colors.get(method),
+                linewidth=1.8,
+            )
+        ax.set_xlabel("# directions (b1000)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{ylabel} vs #directions")
+        ax.set_xticks(sorted({int(r["n_directions"]) for r in summary}))
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(fig_dir / fname, dpi=160)
+        plt.close(fig)
+
+    # Combined 2x3 panel
+    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+    axes = axes.ravel()
+    for ax, (key, ylabel, _) in zip(axes, plot_specs):
+        for method in methods:
+            rows = [r for r in summary if r["method"] == method]
+            rows = sorted(rows, key=lambda r: int(r["n_directions"]))
+            if not rows:
+                continue
+            xs = [int(r["n_directions"]) for r in rows]
+            ys = [float(r[f"{key}_mean"]) for r in rows]
+            es = [float(r[f"{key}_std"]) for r in rows]
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=es,
+                marker="o",
+                capsize=3,
+                label=method.replace("_", " "),
+                color=colors.get(method),
+                linewidth=1.5,
+            )
+        ax.set_xlabel("# directions")
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(sorted({int(r["n_directions"]) for r in summary}))
+        ax.grid(True, alpha=0.3)
+    axes[0].legend(loc="best", fontsize=8)
+    fig.suptitle("Experiment 2: Multi-seed Sparse Robustness (mean ± std)", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(fig_dir / "all_metrics_vs_directions.png", dpi=160)
+    plt.close(fig)
+    print(f"[plots] saved under {fig_dir}")
+
+
+def run_experiment2(config: dict, run_dir: Path, device: torch.device) -> list[dict]:
+    e2 = dict(config.get("experiment2") or {})
+    subject_id = str(e2.get("subject") or config["dataset"]["subjects"][0])
+    n_list = [int(x) for x in e2.get("n_directions", config["sparse"]["n_directions"])]
+    seeds = [int(x) for x in e2.get("seeds", config["sparse"].get("seeds", [1, 2, 3, 4, 5]))]
+    save_figures = bool(e2.get("save_comparison_figures", False))
+
+    hcp_root = config["dataset"]["hcp_root"]
+    shells = list(config.get("reference", {}).get("shells", [1000.0]))
+    ref_root = ROOT / str(config.get("reference", {}).get("root", "reference"))
+
+    print(f"[exp2] subject={subject_id} directions={n_list} seeds={seeds}")
+    ref_maps, _affine, _ref_dir, _full = build_or_load_full_reference(
+        hcp_root=hcp_root,
+        subject_id=subject_id,
+        ref_root=ref_root,
+        shells=shells,
+    )
+    full_collapsed = load_hcp_subject(
+        hcp_root=hcp_root,
+        subject_id=subject_id,
+        shells=shells,
+        collapse_b0=True,
+    )
+
+    subj_dir = run_dir / f"hcp_{subject_id}"
+    rows: list[dict] = []
+    for n_dir in n_list:
+        for seed in seeds:
+            tag = f"n{n_dir}_seed{seed}"
+            print(f"\n===== Exp2 {subject_id} | 1 b0 + {n_dir} DW | seed={seed} =====")
+            out = subj_dir / tag
+            # Skip if already done (resume-friendly)
+            wls_p = out / "metrics_wls.json"
+            inr_p = out / "metrics_inr.json"
+            if wls_p.is_file() and inr_p.is_file():
+                print(f"[skip] existing {tag}")
+                with open(wls_p, encoding="utf-8") as f:
+                    rows.append(json.load(f))
+                with open(inr_p, encoding="utf-8") as f:
+                    rows.append(json.load(f))
+                continue
+            wls_row, inr_row = run_one_sparse_trial(
+                subject_id=subject_id,
+                n_dir=n_dir,
+                sample_seed=seed,
+                full_collapsed=full_collapsed,
+                ref_maps=ref_maps,
+                config=config,
+                device=device,
+                out_dir=out,
+                save_figures=save_figures,
+            )
+            rows.extend([wls_row, inr_row])
+            # Incremental save
+            write_tables(rows, run_dir)
+            summary = aggregate_mean_std(rows)
+            write_exp2_summary(summary, rows, run_dir)
+
+    summary = aggregate_mean_std(rows)
+    write_exp2_summary(summary, rows, run_dir)
+    plot_exp2_curves(summary, run_dir)
+    write_tables(rows, run_dir)
+    return rows
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sparse DTI vs Full Reference pilot")
+    parser = argparse.ArgumentParser(description="Sparse DTI vs Full Reference (+ Exp2 multi-seed)")
     parser.add_argument(
         "--config",
         type=str,
@@ -416,9 +726,21 @@ def main() -> None:
     )
     parser.add_argument("--subjects", nargs="*", default=None)
     parser.add_argument("--n-directions", nargs="*", type=int, default=None)
+    parser.add_argument("--seeds", nargs="*", type=int, default=None, help="Exp2 sampling seeds")
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--force-ref", action="store_true", help="Recompute Full Reference")
-    parser.add_argument("--ref-only", action="store_true", help="Only build reference/, skip sparse")
+    parser.add_argument("--force-ref", action="store_true")
+    parser.add_argument("--ref-only", action="store_true")
+    parser.add_argument(
+        "--exp2",
+        action="store_true",
+        help="Run Experiment 2: multi-seed sparse robustness",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Resume / write into existing experiment folder",
+    )
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -427,19 +749,31 @@ def main() -> None:
         config["dataset"]["subjects"] = list(args.subjects)
     if args.n_directions:
         config["sparse"]["n_directions"] = list(args.n_directions)
+        config.setdefault("experiment2", {})["n_directions"] = list(args.n_directions)
+    if args.seeds:
+        config.setdefault("experiment2", {})["seeds"] = list(args.seeds)
+        config.setdefault("sparse", {})["seeds"] = list(args.seeds)
     if args.epochs is not None:
         config["training"]["epochs"] = int(args.epochs)
 
+    # Auto-enable exp2 if config says so
+    if config.get("experiment2", {}).get("enabled", False):
+        args.exp2 = True
+
     subjects = [str(s) for s in config["dataset"]["subjects"]]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = ROOT / "experiments" / "sparse_vs_full_ref" / stamp
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = "exp2_multiseed" if args.exp2 else "sparse_vs_full_ref"
+        run_dir = ROOT / "experiments" / tag / stamp
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
 
     print(f"[run] {run_dir}")
-    print(f"[run] subjects={subjects} device={device}")
+    print(f"[run] subjects={subjects} device={device} exp2={args.exp2}")
 
     if args.ref_only or args.force_ref:
         ref_root = ROOT / str(config.get("reference", {}).get("root", "reference"))
@@ -456,10 +790,14 @@ def main() -> None:
             print("[done] reference only")
             return
 
-    all_rows: list[dict] = []
-    for sid in subjects:
-        all_rows.extend(run_subject(config, sid, run_dir, device))
-    write_tables(all_rows, run_dir)
+    if args.exp2:
+        run_experiment2(config, run_dir, device)
+    else:
+        all_rows: list[dict] = []
+        for sid in subjects:
+            all_rows.extend(run_subject(config, sid, run_dir, device))
+        write_tables(all_rows, run_dir)
+
     print(f"\n[done] {run_dir}")
     print(f"[ref]  {ROOT / config.get('reference', {}).get('root', 'reference')}")
 

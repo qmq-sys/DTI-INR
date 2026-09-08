@@ -14,7 +14,16 @@ reference:
 sparse:
   n_directions: [6, 15, 30, 45]
   seed: 42
+  seeds: [1, 2, 3, 4, 5]
   # protocol = 1 b0 + n_directions (b0 not counted)
+
+# Experiment 2 (enable via --exp2 or configs/sparse_vs_full_ref_exp2.yaml)
+# experiment2:
+#   enabled: true
+#   subject: "109830"
+#   n_directions: [6, 15, 30, 45]
+#   seeds: [1, 2, 3, 4, 5]
+#   save_comparison_figures: false
 
 model:
   name: spatial_dti_param_field
